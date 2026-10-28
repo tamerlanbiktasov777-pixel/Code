@@ -1,136 +1,46 @@
 
-import os
-import asyncio
-import requests
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MODEL = "qwen2.5-coder:1.5b"
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-
-# Сначала получи свой ID командой /myid.
-# Затем укажи его здесь, чтобы бот отвечал только тебе.
-ALLOWED_USER_ID = 0
-
-histories = {}
-
-SYSTEM_PROMPT = """
-Ты Jarvis — локальный ИИ-помощник пользователя.
-Отвечай на русском языке, если пользователь не попросил другое.
-Помогай программировать, исправлять ошибки и создавать
-проекты для Python, Raspberry Pi и умного дома.
-Объясняй решения понятно и не утверждай, что выполнил
-действие на компьютере, если оно реально не выполнялось.
-Не раскрывай токены, пароли и секретные данные.
-"""
-
-def allowed(update: Update) -> bool:
-    return (
-        ALLOWED_USER_ID == 0
-        or (
-            update.effective_user is not None
-            and update.effective_user.id == ALLOWED_USER_ID
-        )
-    )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sensors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
 
-    await update.message.reply_text(
-        "Привет! Я Jarvis, работаю на твоём Raspberry Pi. "
-        "Напиши вопрос или попроси помочь с кодом.\n\n"
-        "Команды: /myid — узнать свой ID, "
-        "/reset — очистить историю."
-    )
-
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Твой Telegram ID: {update.effective_user.id}"
-    )
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-
-    histories.pop(update.effective_user.id, None)
-    await update.message.reply_text("История диалога очищена.")
-
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-
-    user_id = update.effective_user.id
-    text = update.message.text
-
-    history = histories.setdefault(
-        user_id,
-        [{"role": "system", "content": SYSTEM_PROMPT}]
-    )
-    history.append({"role": "user", "content": text})
-
-    # Ограничиваем историю, чтобы экономить память.
-    history[:] = [history[0]] + history[-12:]
-
-    await update.message.chat.send_action("typing")
+    await update.message.reply_text("Получаю данные Aqara...")
 
     try:
-        response = await asyncio.to_thread(
-            requests.post,
-            OLLAMA_URL,
-            json={
-                "model": MODEL,
-                "messages": history,
-                "stream": False,
-                "keep_alive": "2m",
-                "options": {
-                    "num_ctx": 2048,
-                    "num_predict": 400,
-                },
-            },
-            timeout=240,
+        states = await asyncio.to_thread(get_ha_states)
+
+        keywords = (
+            "aqara", "door", "window", "motion",
+            "движ", "двер", "окн", "температур",
+            "влажност", "tvoc", "air quality",
         )
-        response.raise_for_status()
-        answer = response.json()["message"]["content"].strip()
 
-        history.append({"role": "assistant", "content": answer})
+        lines = []
 
-        # Telegram ограничивает длину одного сообщения.
-        for i in range(0, len(answer), 4000):
-            await update.message.reply_text(answer[i:i + 4000])
+        for item in states:
+            entity_id = item.get("entity_id", "")
+            attrs = item.get("attributes", {})
+            name = attrs.get("friendly_name", entity_id)
 
-    except requests.RequestException as error:
-        history.pop()
+            if any(word in (entity_id + " " + name).lower()
+                   for word in keywords):
+                state = item.get("state", "unknown")
+                unit = attrs.get("unit_of_measurement", "")
+                lines.append(f"• {name}: {state} {unit}".strip())
+
+        if lines:
+            message = "📡 Датчики Aqara и связанные устройства:\n\n"
+            message += "\n".join(lines)
+        else:
+            message = (
+                "Не нашёл датчики по названиям.\n"
+                "Возможно, устройства называются иначе в Home Assistant."
+            )
+
+        await update.message.reply_text(message[:4000])
+
+    except Exception as error:
+        print("Home Assistant error:", repr(error))
         await update.message.reply_text(
-            f"Не удалось связаться с Ollama: {error}"
+            "Не удалось получить данные Home Assistant. "
+            "Проверь HA_URL, HA_TOKEN и доступность Home Assistant."
         )
-    except Exception:
-        if history and history[-1].get("role") == "user":
-            history.pop()
-        await update.message.reply_text(
-            "Произошла ошибка. Проверь Ollama и журнал программы."
-        )
-
-def main():
-    if not TOKEN:
-        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
-
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, chat)
-    )
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
